@@ -1,4 +1,4 @@
-# Void Music Player (Spoti)
+# Void Music Player 
 
 A sleek, aesthetic, and highly intelligent web-based music player and discovery platform. Void combines a minimalist, monochrome design language with advanced audio streaming capabilities and intelligent queueing to provide an immersive listening experience.
 
