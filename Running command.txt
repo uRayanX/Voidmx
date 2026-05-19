@@ -1,0 +1,9 @@
+#inside the folder open a cmd (windows)
+
+g++ -o lottery_Tonni.exe lottery_Tonni.cpp
+
+lottery_Tonni.exe
+
+#Ubontu 
+g++ -o lottery_Tonni lottery_Tonni.cpp
+./lottery
