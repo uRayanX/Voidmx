@@ -1,0 +1,911 @@
+/**
+ * usePlayer.ts
+ *
+ * Full port of Monochrome's Player class (js/player.js) adapted for
+ * React/Zustand without dash.js dependency.
+ *
+ * Features:
+ *  - Quality fallback chain: HI_RES_LOSSLESS → LOSSLESS → HIGH
+ *  - Preload next 2 tracks for gap-free playback
+ *  - Full shuffle with shuffledQueue / originalQueueBeforeShuffle
+ *  - Infinite Radio: auto-trigger recommendations when ≤3 tracks left
+ *  - Full MediaSession API (lock screen / hardware keys)
+ *  - Queue persistence via localStorage (restored on app load)
+ *  - Track skip for unavailable / blocked tracks
+ */
+import { MediaSession } from '@capgo/capacitor-media-session';
+import { Capacitor } from '@capacitor/core';
+import { useEffect, useRef } from 'react';
+import { usePlayerStore, REPEAT_MODE } from '../store/playerStore';
+
+import {
+  getTrackStreamInfo,
+  type StreamInfoResult,
+  addToHistory,
+  getHistory,
+  getFavorites,
+  isFavorite,
+  getRecommendedTracksForPlaylist,
+  addFavorite,
+  removeFavorite,
+} from '../api/tidal';
+import type { TidalTrack } from '../types/tidal';
+
+// ── Module-level singletons (survive React re-mounts / StrictMode) ───────────
+let _audio: HTMLAudioElement | null = null;
+let _playbackSequence = 0;
+let _isFallbackInProgress = false;
+let _restoredTrackOnce = false;
+
+// Preload URL cache (matches Monochrome's preloadCache)
+const _preloadCache = new Map<number, StreamInfoResult>();
+
+// ── Quality preference ─────────────────────────────────────────────────────────
+const QUALITY_KEY = 'void-audio-quality';
+const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'] as const;
+type AudioQuality = typeof VALID_QUALITIES[number];
+
+/** Read the user's preferred quality from Settings (defaults to HI_RES_LOSSLESS). */
+function getPreferredQuality(): AudioQuality {
+  try {
+    const v = localStorage.getItem(QUALITY_KEY) as AudioQuality | null;
+    return v && VALID_QUALITIES.includes(v) ? v : 'HI_RES_LOSSLESS';
+  } catch {
+    return 'HI_RES_LOSSLESS';
+  }
+}
+
+// Track the last quality used so we can bust the preload cache on change
+let _lastQuality: AudioQuality = getPreferredQuality();
+
+// ── Audio singleton ───────────────────────────────────────────────────────────
+function getAudio(): HTMLAudioElement {
+  if (!_audio) {
+    _audio = new Audio();
+    _audio.preload = "auto";
+    _audio.volume = usePlayerStore.getState().volume;
+    // crossOrigin is set dynamically per-URL in setAudioSrc() below:
+    // - proxy URLs need "anonymous" so the browser sends a CORS request and
+    //   respects the Access-Control-Allow-Origin: * header from our proxy.
+    // - direct native/capacitor URLs use no-CORS (crossOrigin = "") to avoid
+    //   preflight issues with Tidal CDN.
+  }
+  return _audio;
+}
+
+/**
+ * Set audio.src and configure crossOrigin appropriately.
+ * Proxied URLs (going through /proxy-audio) need crossOrigin="anonymous" so
+ * the browser sends a CORS request and respects the ACAO:* response header.
+ * Direct Tidal CDN or capacitor URLs must NOT set crossOrigin or they'll fail
+ * preflight (Tidal CDN doesn't respond to OPTIONS requests properly).
+ */
+function setAudioSrc(audio: HTMLAudioElement, url: string) {
+  if (url && url.includes('/proxy-audio?url=')) {
+    // Proxied: need CORS mode so browser respects Access-Control-Allow-Origin: *
+    audio.crossOrigin = 'anonymous';
+  } else {
+    // Direct URL (native, capacitor, or no proxy): no-CORS mode
+    audio.crossOrigin = '';
+  }
+  audio.src = url;
+}
+
+// ── Public helpers (used by other components) ─────────────────────────────────
+export function seekAudio(posMs: number) {
+  getAudio().currentTime = posMs / 1000;
+}
+
+export function setAudioVolume(vol: number) {
+  const v = Math.max(0, Math.min(1, vol));
+  getAudio().volume = v;
+  usePlayerStore.getState().setVolume(v);
+}
+
+/** Expose the raw audio element for external control (e.g. playbackRate). */
+export function getAudioElement(): HTMLAudioElement | null {
+  return _audio;
+}
+
+// ── isTrackUnavailable (matches Monochrome isTrackUnavailable) ───────────────
+function isTrackUnavailable(track: TidalTrack): boolean {
+  return track.allowStreaming === false;
+}
+
+// ── Shuffle helpers ───────────────────────────────────────────────────────────
+function fisherYates<T>(arr: T[]): T[] {
+  const a = [...arr];
+  for (let i = a.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [a[i], a[j]] = [a[j], a[i]];
+  }
+  return a;
+}
+
+// ── Preload next tracks (Monochrome preloadNextTracks) ────────────────────────
+async function preloadNextTracks(queue: TidalTrack[], queueIndex: number) {
+  const quality = getPreferredQuality();
+  // If quality changed since last preload, wipe the cache so we don't serve
+  // cached URLs at the wrong quality.
+  if (quality !== _lastQuality) {
+    _preloadCache.clear();
+    _lastQuality = quality;
+  }
+  for (let i = 1; i <= 2; i++) {
+    const nextIdx = queueIndex + i;
+    if (nextIdx >= queue.length) break;
+    const track = queue[nextIdx];
+    if (!track || _preloadCache.has(track.id) || isTrackUnavailable(track)) continue;
+    try {
+      const res = await getTrackStreamInfo(track.id, quality);
+      _preloadCache.set(track.id, res);
+    } catch {}
+  }
+}
+
+// ── Prune preload cache (Monochrome pruneStreamCache logic) ───────────────────
+function prunePreloadCache() {
+  if (_preloadCache.size > 50) {
+    const entries = Array.from(_preloadCache.entries());
+    entries.slice(0, entries.length - 50).forEach(([k]) => _preloadCache.delete(k));
+  }
+}
+
+// ── Radio: pick seeds from history + favorites ────────────────────────────────
+// Matches Monochrome's pickRadioSeeds()
+async function pickRadioSeeds(): Promise<TidalTrack[]> {
+  try {
+    const history = getHistory(50);
+    const favorites = getFavorites();
+
+    const potentialSeeds: TidalTrack[] = [];
+
+    // History weighted by frequency
+    if (history.length > 0) {
+      const freqMap = new Map<number, number>();
+      history.forEach(t => freqMap.set(t.id, (freqMap.get(t.id) ?? 0) + 1));
+      const deduped = Array.from(new Map(history.map(t => [t.id, t])).values());
+      const sorted = deduped.sort((a, b) => (freqMap.get(b.id) ?? 0) - (freqMap.get(a.id) ?? 0));
+      potentialSeeds.push(...sorted.slice(0, 20));
+    }
+
+    potentialSeeds.push(...favorites);
+
+    if (potentialSeeds.length === 0) {
+      const current = usePlayerStore.getState().currentTrack;
+      return current ? [current] : [];
+    }
+
+    // Deduplicate + shuffle
+    const unique = Array.from(new Map(potentialSeeds.map(s => [s.id, s])).values());
+    return unique.sort(() => 0.5 - Math.random()).slice(0, 50);
+  } catch {
+    const current = usePlayerStore.getState().currentTrack;
+    return current ? [current] : [];
+  }
+}
+
+// ── Radio: fetch recommendations and append to queue ─────────────────────────
+// Matches Monochrome's fetchRadioRecommendations()
+let _isFetchingRadio = false;
+let _radioFetchPromise: Promise<void> | null = null;
+const _sessionKnownTrackIds = new Set<number>();
+
+export function fetchRadioRecommendations(): Promise<void> {
+  if (_isFetchingRadio) return _radioFetchPromise ?? Promise.resolve();
+  _isFetchingRadio = true;
+  usePlayerStore.getState().setIsFetchingRadio(true);
+
+  _radioFetchPromise = (async () => {
+    try {
+      const store = usePlayerStore.getState();
+      const currentQueue = store.getCurrentQueue();
+
+      let seeds = store.radioSeeds;
+      const recentQueueTracks = currentQueue.slice(-10);
+
+      // If no explicit radio seeds exist (i.e. Autoplay triggered from a regular playlist/album),
+      // we must seed the algorithm using the vibe of the tracks that just finished playing.
+      if (seeds.length === 0) {
+        seeds = recentQueueTracks.length > 0 
+          ? recentQueueTracks 
+          : (store.currentTrack ? [store.currentTrack] : []);
+          
+        if (seeds.length === 0) {
+          seeds = await pickRadioSeeds(); // Last absolute fallback
+        }
+        store.setRadioSeeds(seeds);
+      }
+
+      // Mix original seeds with the recently added tracks to allow infinite drifting
+      const combinedSeeds = [...seeds, ...recentQueueTracks];
+      const uniqueSeeds = Array.from(new Map(combinedSeeds.map(t => [t.id, t])).values());
+      
+      const shuffledSeeds = uniqueSeeds.sort(() => 0.5 - Math.random());
+      const effectiveSeeds = shuffledSeeds.length > 0
+        ? shuffledSeeds.slice(0, 10)
+        : store.currentTrack ? [store.currentTrack] : [];
+
+      if (effectiveSeeds.length === 0) return;
+
+      // Record everything seen in the current queue into the session-level blocked list
+      currentQueue.forEach(t => _sessionKnownTrackIds.add(t.id));
+
+      const knownTrackIds = new Set<number>([
+        ..._sessionKnownTrackIds,
+        ...getHistory(50).map(t => t.id),
+      ]);
+
+      // Pass existing queue for artist spacing enforcement
+      const recommendations = await getRecommendedTracksForPlaylist(effectiveSeeds, 40, {
+        knownTrackIds,
+        existingQueue: currentQueue,
+      });
+
+      if (recommendations.length > 0) {
+        const queueIds = new Set(currentQueue.map(t => t.id));
+        const newTracks = recommendations.filter(t => !queueIds.has(t.id));
+        if (newTracks.length > 0) {
+          // Add up to 20 new tracks per fetch for a truly infinite queue
+          const toAdd = newTracks.slice(0, 20);
+          usePlayerStore.getState().addToQueue(toAdd);
+        }
+      }
+    } catch (err) {
+      console.error('[Radio] Failed to fetch recommendations:', err);
+    } finally {
+      _isFetchingRadio = false;
+      _radioFetchPromise = null;
+      usePlayerStore.getState().setIsFetchingRadio(false);
+    }
+  })();
+
+  return _radioFetchPromise;
+}
+
+// ── Enable / disable radio ────────────────────────────────────────────────────
+export async function enableRadio(seeds: TidalTrack[] = []) {
+  const store = usePlayerStore.getState();
+  store.setRadioEnabled(true);
+
+  if (seeds.length === 0) {
+    store.wipeQueue();
+    const pickedSeeds = await pickRadioSeeds();
+    if (pickedSeeds.length === 0) { store.setRadioEnabled(false); return; }
+    store.setRadioSeeds(pickedSeeds);
+    const initialQueue = [...pickedSeeds].sort(() => 0.5 - Math.random()).slice(0, 10);
+    store.setQueue(initialQueue, 0, true);
+    // start playing
+    playTrackFromQueue(0);
+  } else {
+    const seedArr = Array.isArray(seeds) ? seeds : [seeds];
+    store.setRadioSeeds(seedArr);
+    store.wipeQueue();
+    const initialQueue = seedArr.slice(0, 10);
+    store.setQueue(initialQueue, 0, true);
+    playTrackFromQueue(0);
+  }
+
+  // Immediately fill the queue with 20 more tracks
+  await fetchRadioRecommendations();
+}
+
+export function disableRadio() {
+  usePlayerStore.getState().setRadioEnabled(false);
+}
+
+// ── Toggle shuffle (full Monochrome logic) ────────────────────────────────────
+export function toggleShuffle() {
+  const store = usePlayerStore.getState();
+  const { queue, originalQueueBeforeShuffle, queueIndex, shuffleActive, currentTrack } = store;
+
+  if (!shuffleActive) {
+    // Turn ON: save original, place current at front of shuffled queue
+    const original = [...queue];
+    const tracksToShuffle = [...queue];
+    const currentIdx = queueIndex;
+    const current = tracksToShuffle.splice(currentIdx < 0 ? 0 : currentIdx, 1)[0];
+    const shuffled = fisherYates(tracksToShuffle);
+    const newShuffledQueue = current ? [current, ...shuffled] : shuffled;
+
+    store.setShuffleState({
+      shuffleActive: true,
+      queue,
+      shuffledQueue: newShuffledQueue,
+      originalQueueBeforeShuffle: original,
+      queueIndex: 0,
+      currentTrack: current ?? currentTrack,
+    });
+  } else {
+    // Turn OFF: restore original queue, find current track's index in it
+    const restoredQueue = [...originalQueueBeforeShuffle];
+    const currentTrackInQueue = currentTrack
+      ? restoredQueue.findIndex(t => t.id === currentTrack.id)
+      : -1;
+
+    store.setShuffleState({
+      shuffleActive: false,
+      queue: restoredQueue,
+      shuffledQueue: [],
+      originalQueueBeforeShuffle: [],
+      queueIndex: currentTrackInQueue >= 0 ? currentTrackInQueue : queueIndex,
+      currentTrack,
+    });
+  }
+
+  prunePreloadCache();
+  _preloadCache.clear();
+}
+
+// ── Play track by advancing queue state ──────────────────────────────────────
+// Called internally to play the track at queueIndex after state is set
+export function playTrackFromQueue(startTime = 0) {
+  const store = usePlayerStore.getState();
+  const currentQueue = store.getCurrentQueue();
+  const { queueIndex, currentTrack } = store;
+
+  if (queueIndex < 0 || queueIndex >= currentQueue.length) return;
+  const track = currentQueue[queueIndex];
+
+  if (!track) return;
+
+  // Skip unavailable tracks
+  if (isTrackUnavailable(track)) {
+    playNext(0);
+    return;
+  }
+
+  const seq = ++_playbackSequence;
+
+  const audio = getAudio();
+  audio.pause();
+  setAudioSrc(audio, '');
+
+  // Update store current track
+  if (currentTrack?.id !== track.id) {
+    // The setQueue already sets currentTrack, but if we're advancing index:
+    usePlayerStore.setState({ currentTrack: track, positionMs: 0 });
+  }
+
+  // Update MediaSession immediately
+  updateMediaSession(track);
+  updateMediaSessionPlaybackState();
+  document.title = `${track.title} • ${track.artists?.map(a => a.name).join(', ') ?? track.artist?.name ?? ''}`;
+
+  ;(async () => {
+    try {
+      let streamUrl: string;
+      let streamInfo: any = null;
+
+      if (_preloadCache.has(track.id)) {
+        const res = _preloadCache.get(track.id)!;
+        streamUrl = res.url;
+        streamInfo = res.streamInfo;
+      } else {
+        const res = await getTrackStreamInfo(track.id, getPreferredQuality());
+        streamUrl = res.url;
+        streamInfo = res.streamInfo;
+      }
+
+      if (streamInfo) {
+        usePlayerStore.setState(state => {
+          if (state.currentTrack?.id === track.id) {
+            return { currentTrack: { ...state.currentTrack, streamInfo } };
+          }
+          return state;
+        });
+      }
+
+      if (_playbackSequence !== seq) return; // superseded
+
+      try {
+        setAudioSrc(audio, streamUrl);
+        await waitForCanPlay(audio);
+      } catch (err: any) {
+        // Caching fallback: if it fails and was playing from local filesystem cache, redownload overriding the cache
+        if (streamUrl.includes('_capacitor_file_')) {
+          console.warn(`[Player] Failed to play cached stream for ${track.id}. Overriding cache and falling back to network.`);
+          const freshRes = await getTrackStreamInfo(track.id, getPreferredQuality(), true);
+          streamUrl = freshRes.url;
+          streamInfo = freshRes.streamInfo;
+          
+          if (_playbackSequence !== seq) return;
+          setAudioSrc(audio, streamUrl);
+          await waitForCanPlay(audio);
+        } else {
+          throw err; // throw to quality fallback
+        }
+      }
+
+      if (_playbackSequence !== seq) return;
+
+      if (startTime > 0) audio.currentTime = startTime;
+
+      await audio.play();
+      if (_playbackSequence !== seq) return;
+
+      addToHistory(track);
+      preloadNextTracks(currentQueue, queueIndex);
+      prunePreloadCache();
+
+      // Auto-radio disabled.
+      store.persistQueue();
+
+    } catch (err: unknown) {
+      if (_playbackSequence !== seq) return;
+      const error = err as Error;
+      if (error.name === 'NotAllowedError' || error.name === 'AbortError') {
+        usePlayerStore.getState().setIsPaused(true);
+        return;
+      }
+
+      // Quality fallback: HI_RES_LOSSLESS → LOSSLESS → HIGH (Monochrome behaviour)
+      if (!_isFallbackInProgress) {
+        _isFallbackInProgress = true;
+        try {
+          let url: string | null = null;
+          let streamInfo: any = null;
+          for (const quality of ['LOSSLESS', 'HIGH'] as const) {
+            try {
+              const res = await getTrackStreamInfo(track.id, quality);
+              url = res.url;
+              streamInfo = res.streamInfo;
+              break;
+            } catch {}
+          }
+          if (!url || _playbackSequence !== seq) { _isFallbackInProgress = false; return; }
+          
+          if (streamInfo) {
+            usePlayerStore.setState(state => {
+              if (state.currentTrack?.id === track.id) {
+                return { currentTrack: { ...state.currentTrack, streamInfo } };
+              }
+              return state;
+            });
+          }
+
+          setAudioSrc(audio, url);
+          await waitForCanPlay(audio);
+          if (_playbackSequence !== seq) { _isFallbackInProgress = false; return; }
+          await audio.play();
+          addToHistory(track);
+          preloadNextTracks(currentQueue, queueIndex);
+        } catch (fallbackErr) {
+          console.warn('[Player] Fallback failed, skipping:', fallbackErr);
+          setTimeout(() => playNext(1), 1000);
+        } finally {
+          _isFallbackInProgress = false;
+        }
+        return;
+      }
+
+      console.error('[Player] Could not play track, skipping:', track.title, err);
+      setTimeout(() => playNext(1), 1000);
+    }
+  })();
+}
+
+async function waitForCanPlay(audio: HTMLAudioElement, timeoutMs = 10000): Promise<void> {
+  if (audio.readyState >= 2) return;
+  return new Promise((resolve, reject) => {
+    const onReady = () => { cleanup(); resolve(); };
+    const onErr   = (e: Event) => { cleanup(); reject(e); };
+    const timer   = setTimeout(() => { cleanup(); reject(new Error('Timeout waiting for canplay')); }, timeoutMs);
+    function cleanup() {
+      audio.removeEventListener('canplay', onReady);
+      audio.removeEventListener('error', onErr);
+      clearTimeout(timer);
+    }
+    audio.addEventListener('canplay', onReady);
+    audio.addEventListener('error', onErr);
+  });
+}
+
+// ── Next / Previous ───────────────────────────────────────────────────────────
+export function playNext(recursiveCount = 0) {
+  const store = usePlayerStore.getState();
+  const currentQueue = store.getCurrentQueue();
+  const { queueIndex, repeatMode, radioEnabled } = store;
+  const isLastTrack = queueIndex >= currentQueue.length - 1;
+
+  if (recursiveCount > currentQueue.length) {
+    if (radioEnabled && isLastTrack) {
+      fetchRadioRecommendations().then(() => {
+        const updated = usePlayerStore.getState().getCurrentQueue();
+        const idx = usePlayerStore.getState().queueIndex;
+        if (idx < updated.length - 1) {
+          usePlayerStore.setState({ queueIndex: idx + 1, currentTrack: updated[idx + 1], positionMs: 0 });
+          playTrackFromQueue();
+        } else {
+          getAudio().pause();
+          usePlayerStore.getState().setIsPaused(true);
+        }
+      });
+      return;
+    }
+    console.error('[Player] All tracks are unavailable.');
+    getAudio().pause();
+    return;
+  }
+
+  // Auto-fill queue with infinite radio when nearing the end (unless repeating fixed queue)
+  const shouldAutoFetch = radioEnabled || (repeatMode === REPEAT_MODE.OFF);
+  if (shouldAutoFetch && queueIndex >= currentQueue.length - 5) {
+    if (!radioEnabled) {
+      usePlayerStore.getState().setRadioEnabled(true);
+    }
+    fetchRadioRecommendations();
+  }
+
+  if (repeatMode === REPEAT_MODE.ONE && !isTrackUnavailable(currentQueue[queueIndex])) {
+    playTrackFromQueue(0);
+    return;
+  }
+
+  if (!isLastTrack) {
+    const nextIdx = queueIndex + 1;
+    const next = currentQueue[nextIdx];
+    if (!next || isTrackUnavailable(next)) {
+      usePlayerStore.setState({ queueIndex: nextIdx });
+      playNext(recursiveCount + 1);
+      return;
+    }
+    usePlayerStore.setState({ queueIndex: nextIdx, currentTrack: next, positionMs: 0 });
+    playTrackFromQueue();
+  } else if (radioEnabled) {
+    fetchRadioRecommendations().then(() => {
+      const updated = usePlayerStore.getState().getCurrentQueue();
+      const idx = usePlayerStore.getState().queueIndex;
+      if (idx < updated.length - 1) {
+        const nextIdx2 = idx + 1;
+        usePlayerStore.setState({ queueIndex: nextIdx2, currentTrack: updated[nextIdx2], positionMs: 0 });
+        playTrackFromQueue();
+      } else {
+        console.log('[Player] Radio exhausted. Stopping.');
+        getAudio().pause();
+        usePlayerStore.getState().setIsPaused(true);
+      }
+    });
+  } else if (repeatMode === REPEAT_MODE.ALL) {
+    const first = currentQueue[0];
+    if (!first || isTrackUnavailable(first)) {
+      usePlayerStore.setState({ queueIndex: 0 });
+      playNext(recursiveCount + 1);
+      return;
+    }
+    usePlayerStore.setState({ queueIndex: 0, currentTrack: first, positionMs: 0 });
+    playTrackFromQueue();
+  } else {
+    // Fallback: End of queue, auto-start infinite radio mode if we somehow got here
+    console.log('[Player] Reached end of queue. Auto-starting infinite radio.');
+    usePlayerStore.getState().setRadioEnabled(true);
+    fetchRadioRecommendations().then(() => {
+      const updated = usePlayerStore.getState().getCurrentQueue();
+      const idx = usePlayerStore.getState().queueIndex;
+      if (idx < updated.length - 1) {
+        const nextIdx2 = idx + 1;
+        usePlayerStore.setState({ queueIndex: nextIdx2, currentTrack: updated[nextIdx2], positionMs: 0 });
+        playTrackFromQueue();
+      } else {
+        console.log('[Player] Radio exhausted. Stopping.');
+        getAudio().pause();
+        usePlayerStore.getState().setIsPaused(true);
+      }
+    });
+  }
+}
+
+function playPrev() {
+  const audio = getAudio();
+  const store = usePlayerStore.getState();
+  const currentQueue = store.getCurrentQueue();
+  const { queueIndex } = store;
+
+  if (audio.currentTime > 3) {
+    // Restart current track
+    audio.currentTime = 0;
+    return;
+  }
+
+  if (queueIndex > 0) {
+    const prevIdx = queueIndex - 1;
+    const prev = currentQueue[prevIdx];
+    if (prev && !isTrackUnavailable(prev)) {
+      usePlayerStore.setState({ queueIndex: prevIdx, currentTrack: prev, positionMs: 0 });
+      playTrackFromQueue();
+    }
+  }
+}
+
+// ── MediaSession (Monochrome setupMediaSession / updateMediaSession) ──────────
+
+function syncAndroidBridge() {
+  if (typeof window === 'undefined' || !(window as any).AndroidBridge) return;
+  const store = usePlayerStore.getState();
+  const track = store.currentTrack;
+  if (!track) return;
+  
+  const audio = getAudio();
+  const isPlaying = !audio.paused;
+  const liked = isFavorite(track.id);
+  const coverUrl = track.album?.cover || '';
+  const parsedCoverUrl = coverUrl ? `https://resources.tidal.com/images/${coverUrl.replace(/-/g, '/')}/320x320.jpg` : '';
+
+  try {
+    (window as any).AndroidBridge.updateMediaState(
+      track.title || 'Unknown',
+      track.artists?.[0]?.name || track.artist?.name || 'Unknown Artist',
+      parsedCoverUrl,
+      isPlaying,
+      liked,
+      audio.duration || 0,
+      audio.currentTime || 0
+    );
+  } catch (e) {}
+}
+
+if (typeof window !== 'undefined' && !(window as any)._androidBound) {
+  (window as any)._androidBound = true;
+  (window as any).onAndroidPlay = () => getAudio().play().catch(handlePlayPause);
+  (window as any).onAndroidPause = () => getAudio().pause();
+  (window as any).onAndroidNotificationClick = () => {
+    window.history.pushState({}, '', '/now');
+    window.dispatchEvent(new PopStateEvent('popstate'));
+  };
+  (window as any).onAndroidSeek = (posMs: number) => {
+    const audio = getAudio();
+    if (!isNaN(audio.duration)) {
+      audio.currentTime = posMs / 1000;
+    }
+  };
+  (window as any).onAndroidNext = () => playNext();
+  (window as any).onAndroidPrev = () => playPrev();
+  (window as any).onAndroidLike = () => {
+    const track = usePlayerStore.getState().currentTrack;
+    if (track) {
+      if (isFavorite(track.id)) {
+        removeFavorite(track.id);
+      } else {
+        addFavorite(track);
+      }
+      syncAndroidBridge();
+      window.dispatchEvent(new Event('storage'));
+    }
+  };
+  (window as any).onAndroidRadio = () => {
+    const store = usePlayerStore.getState();
+    const track = store.currentTrack;
+    if (!track) return;
+    getRecommendedTracksForPlaylist([track], 40).then(queue => store.setQueue(queue, 0, true));
+  };
+}
+
+async function updateMediaSession(track: TidalTrack) {
+  const coverUuid = track.album?.cover;
+  const artists = track.artists?.map(a => a.name).join(', ') ?? track.artist?.name ?? '';
+  const artworkUrl = coverUuid ? `https://resources.tidal.com/images/${coverUuid.replace(/-/g, '/')}/1280x1280.jpg` : '';
+
+  if (Capacitor.isNativePlatform()) {
+    try {
+      const metaOpts: any = {
+        title: track.title ?? 'Unknown',
+        artist: artists,
+        album: track.album?.title ?? ''
+      };
+      if (artworkUrl) {
+        metaOpts.artwork = [{
+          src: artworkUrl,
+          sizes: '1280x1280',
+          type: 'image/jpeg'
+        }];
+      }
+      await MediaSession.setMetadata(metaOpts);
+    } catch (e) {
+      console.error('MediaSession native error:', e);
+    }
+  } else if ('mediaSession' in navigator) {
+    navigator.mediaSession.metadata = null;
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: track.title ?? 'Unknown',
+      artist: artists,
+      album: track.album?.title ?? '',
+      artwork: artworkUrl ? [{ src: artworkUrl, sizes: '1280x1280', type: 'image/jpeg' }] : []
+    });
+  }
+  syncAndroidBridge();
+}
+
+function updateMediaSessionPlaybackState() {
+  const isPlaying = !getAudio().paused;
+  if (Capacitor.isNativePlatform()) {
+    MediaSession.setPlaybackState({ playbackState: isPlaying ? 'playing' : 'paused' }).catch(()=>{});
+  syncAndroidBridge();
+  } else if ('mediaSession' in navigator) {
+    navigator.mediaSession.playbackState = isPlaying ? 'playing' : 'paused';
+  }
+}
+
+function updateMediaSessionPosition() {
+  const audio = getAudio();
+  const duration = audio.duration;
+  if (!duration || isNaN(duration) || !isFinite(duration)) return;
+  const pos = Math.min(audio.currentTime, duration);
+  if (Capacitor.isNativePlatform()) {
+    MediaSession.setPositionState({
+      duration,
+      playbackRate: audio.playbackRate || 1,
+      position: pos,
+    }).catch(()=>{});
+  } else if ('mediaSession' in navigator && 'setPositionState' in navigator.mediaSession) {
+    try { navigator.mediaSession.setPositionState({ duration, playbackRate: audio.playbackRate || 1, position: pos }); } catch {}
+  }
+}
+
+function setupMediaSessionHandlers() {
+  const playHandler = async () => { try { await getAudio().play(); } catch { handlePlayPause(); } };
+  const pauseHandler = () => { getAudio().pause(); };
+  const prevHandler = () => { playPrev(); };
+  const nextHandler = () => { playNext(); };
+  const seekBwdHandler = (d: any) => { const a = getAudio(); a.currentTime = Math.max(0, a.currentTime - (d?.seekOffset ?? d?.seekTime ?? 10)); updateMediaSessionPosition(); };
+  const seekFwdHandler = (d: any) => { const a = getAudio(); a.currentTime = Math.min(a.duration || 0, a.currentTime + (d?.seekOffset ?? d?.seekTime ?? 10)); updateMediaSessionPosition(); };
+  const seekToHandler = (d: any) => { if (d?.seekTime !== undefined) { getAudio().currentTime = Math.max(0, d.seekTime); updateMediaSessionPosition(); } };
+  const stopHandler = () => { const a = getAudio(); a.pause(); a.currentTime = 0; updateMediaSessionPlaybackState();
+  syncAndroidBridge();
+};
+
+  if (Capacitor.isNativePlatform()) {
+    MediaSession.setActionHandler({ action: 'play' }, playHandler);
+    MediaSession.setActionHandler({ action: 'pause' }, pauseHandler);
+    MediaSession.setActionHandler({ action: 'previoustrack' }, prevHandler);
+    MediaSession.setActionHandler({ action: 'nexttrack' }, nextHandler);
+    MediaSession.setActionHandler({ action: 'seekbackward' }, seekBwdHandler);
+    MediaSession.setActionHandler({ action: 'seekforward' }, seekFwdHandler);
+    MediaSession.setActionHandler({ action: 'seekto' }, seekToHandler);
+    MediaSession.setActionHandler({ action: 'stop' }, stopHandler);
+  } else if ('mediaSession' in navigator) {
+    navigator.mediaSession.setActionHandler('play', playHandler);
+    navigator.mediaSession.setActionHandler('pause', pauseHandler);
+    navigator.mediaSession.setActionHandler('previoustrack', prevHandler);
+    navigator.mediaSession.setActionHandler('nexttrack', nextHandler);
+    navigator.mediaSession.setActionHandler('seekbackward', seekBwdHandler);
+    navigator.mediaSession.setActionHandler('seekforward', seekFwdHandler);
+    navigator.mediaSession.setActionHandler('seekto', seekToHandler);
+    navigator.mediaSession.setActionHandler('stop', stopHandler);
+  }
+}
+
+// ── Play / Pause ──────────────────────────────────────────────────────────────
+function handlePlayPause() {
+  const audio = getAudio();
+  const store = usePlayerStore.getState();
+  if (!audio.src || audio.error) {
+    if (store.currentTrack) playTrackFromQueue(0);
+    return;
+  }
+  if (audio.paused) {
+    audio.play().catch(() => {
+      if (store.currentTrack) playTrackFromQueue(0);
+    });
+  } else {
+    audio.pause();
+    store.persistQueue();
+  }
+}
+
+// ── React hook ────────────────────────────────────────────────────────────────
+export function usePlayer() {
+  const initRef = useRef(false);
+
+  useEffect(() => {
+    if (initRef.current) return;
+    initRef.current = true;
+
+    const audio = getAudio();
+
+    // ── Audio event listeners ─────────────────────────────────────────────
+    const onTimeUpdate = () => {
+      usePlayerStore.getState().setPositionMs(audio.currentTime * 1000);
+      updateMediaSessionPosition();
+    };
+    const onProgress = () => {
+      if (audio.buffered.length > 0) {
+        const bufferedEnd = audio.buffered.end(audio.buffered.length - 1);
+        usePlayerStore.getState().setBufferedMs(bufferedEnd * 1000);
+      } else {
+        usePlayerStore.getState().setBufferedMs(0);
+      }
+    };
+    const onDurationChange = () => {
+      usePlayerStore.getState().setDurationMs(isNaN(audio.duration) ? 0 : audio.duration * 1000);
+      onProgress();
+    };
+    const onPause = () => {
+      usePlayerStore.getState().setIsPaused(true);
+      updateMediaSessionPlaybackState();
+  syncAndroidBridge();
+};
+    const onPlay = () => {
+      usePlayerStore.getState().setIsPaused(false);
+      updateMediaSessionPlaybackState();
+      syncAndroidBridge();
+    };
+    const onPlaying = () => {
+      usePlayerStore.getState().setIsLoading(false);
+    };
+    const onWaiting = () => {
+      usePlayerStore.getState().setIsLoading(true);
+    };
+    const onLoadStart = () => {
+      usePlayerStore.getState().setIsLoading(true);
+    };
+    const onCanPlay = () => {
+      usePlayerStore.getState().setIsLoading(false);
+    };
+    const onEnded = () => { playNext(0); };
+    const onError = (e: Event) => {
+      usePlayerStore.getState().setIsLoading(false);
+      console.warn('[Player] audio error', e);
+    };
+
+    audio.addEventListener('timeupdate',     onTimeUpdate);
+    audio.addEventListener('seeked',         () => { updateMediaSessionPosition(); syncAndroidBridge(); });
+    audio.addEventListener('progress',       onProgress);
+    audio.addEventListener('durationchange', onDurationChange);
+    audio.addEventListener('ended',          onEnded);
+    audio.addEventListener('pause',          onPause);
+    audio.addEventListener('play',           onPlay);
+    audio.addEventListener('playing',        onPlaying);
+    audio.addEventListener('waiting',        onWaiting);
+    audio.addEventListener('loadstart',      onLoadStart);
+    audio.addEventListener('canplay',        onCanPlay);
+    audio.addEventListener('error',          onError);
+
+    // ── MediaSession ─────────────────────────────────────────────────────
+    setupMediaSessionHandlers();
+
+    // ── Register PlayerActions in store ──────────────────────────────────
+    usePlayerStore.getState().setPlayer({
+      togglePlay: handlePlayPause,
+      nextTrack:  () => playNext(0),
+      previousTrack: playPrev,
+      enableRadio,
+      disableRadio,
+      toggleShuffle,
+    });
+
+    // Apply stored volume
+    audio.volume = usePlayerStore.getState().volume;
+
+    // ── Restore queue from localStorage ──────────────────────────────────
+    if (!_restoredTrackOnce) {
+      _restoredTrackOnce = true;
+      usePlayerStore.getState().restoreQueue();
+      // NOTE: We restore metadata only, NOT auto-play, matching Monochrome behaviour.
+    }
+
+     
+  }, []);
+
+  // ── Subscribe to currentTrack changes ────────────────────────────────────
+  // This drives actual playback changes when setQueue / addToQueue is called.
+  useEffect(() => {
+    const unsub = usePlayerStore.subscribe(
+      s => s.currentTrack,
+      (currentTrack, prevTrack) => {
+        if (!currentTrack) return;
+        if (prevTrack?.id === currentTrack.id) return;
+        playTrackFromQueue(0);
+      },
+    );
+    return unsub;
+  }, []);
+
+  // ── Subscribe to volume changes ───────────────────────────────────────────
+  useEffect(() => {
+    const unsub = usePlayerStore.subscribe(
+      s => s.volume,
+      (vol) => { getAudio().volume = Math.max(0, Math.min(1, vol)); },
+    );
+    return unsub;
+  }, []);
+}
