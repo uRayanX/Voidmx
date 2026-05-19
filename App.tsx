@@ -98,7 +98,7 @@ const NavPill: React.FC = () => {
 
   const isNowPage = location.pathname.startsWith('/now');
   const hasTrack = !!currentTrack;
-
+  //gg
   // The controls should be visible if we are NOT on the /now page AND we have a track
   const showControls = !isNowPage && hasTrack;
   const showOnlyPlay = showControls && isPaused;
