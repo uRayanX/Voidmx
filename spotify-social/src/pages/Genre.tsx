@@ -11,10 +11,18 @@ export const Genre: React.FC = () => {
   useEffect(() => {
     if (!id) return;
     setLoading(true);
-    fetch(`https://hot.monochrome.tf/explore/genre/?id=${id}`)
-      .then(res => res.json())
-      .then(res => {
-        setData(res);
+    const genreName = getGenreName(id);
+    Promise.all([
+      import('../api/tidal').then(m => m.searchAlbums(`${genreName} music`, 20)),
+      import('../api/tidal').then(m => m.searchPlaylists(`${genreName} music`, 20))
+    ])
+      .then(([albums, playlists]) => {
+        setData({
+          trending_albums: albums,
+          sections: [
+            { type: 'PLAYLIST_LIST', title: 'Top Playlists', items: playlists }
+          ]
+        });
         setLoading(false);
       })
       .catch(err => {

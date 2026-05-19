@@ -194,7 +194,8 @@ export const NowPlaying: React.FC = () => {
   };
 
 
-  const albumArt = currentTrack?.album?.cover ? getCoverUrl(currentTrack.album.cover, 640) : null;
+  const albumArt = getCoverUrl(currentTrack?.album?.cover, 640);
+  console.log("DEBUG: albumArt URL ->", albumArt, "Original cover ->", currentTrack?.album?.cover);
   const panelOpen = showLyrics || showQueue;
 
   if (!currentTrack) {

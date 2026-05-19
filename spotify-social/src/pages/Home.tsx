@@ -78,13 +78,36 @@ export const Home = () => {
           
      // 2. Fetch specific recommendations based on extracted info
      if (bestArtist) {
-         searchPlaylists(bestArtist.name, 10).then(p => setPublicPlaylists(p.slice(0, 8))).catch(() => {});
          const secondArtist = sortedArtists[1]?.data || bestArtist;
          if (secondArtist) {
              searchPlaylists(secondArtist.name + " mix", 10).then(p => setGenrePlaylists(p.slice(0, 6))).catch(() => {});
          }
-         searchAlbums(bestArtist.name, 10).then(a => setAlbumMix(a.slice(0, 8))).catch(() => {});
-         getSimilarArtists(bestArtist.id).then(a => setSimArtists(a.slice(0, 8))).catch(() => {});
+         if (bestArtist.id && bestArtist.id !== 'unknown') {
+           import('../api/tidal').then(m => m.getArtist(bestArtist.id)).then(artistData => {
+             if (artistData.playlists && artistData.playlists.length > 0) {
+               setPublicPlaylists(artistData.playlists.slice(0, 8));
+             } else {
+               searchPlaylists(bestArtist.name, 10).then(p => setPublicPlaylists(p.slice(0, 8))).catch(() => {});
+             }
+             if (artistData.albums && artistData.albums.length > 0) {
+               setAlbumMix(artistData.albums.slice(0, 8));
+             } else {
+               searchAlbums(bestArtist.name, 10).then(a => setAlbumMix(a.slice(0, 8))).catch(() => {});
+             }
+             if (artistData.similar && artistData.similar.length > 0) {
+               setSimArtists(artistData.similar.slice(0, 8));
+             } else {
+               getSimilarArtists(bestArtist.id).then(a => setSimArtists(a.slice(0, 8))).catch(() => {});
+             }
+           }).catch(() => {
+             searchPlaylists(bestArtist.name, 10).then(p => setPublicPlaylists(p.slice(0, 8))).catch(() => {});
+             searchAlbums(bestArtist.name, 10).then(a => setAlbumMix(a.slice(0, 8))).catch(() => {});
+             getSimilarArtists(bestArtist.id).then(a => setSimArtists(a.slice(0, 8))).catch(() => {});
+           });
+         } else {
+           searchPlaylists(bestArtist.name, 10).then(p => setPublicPlaylists(p.slice(0, 8))).catch(() => {});
+           searchAlbums(bestArtist.name, 10).then(a => setAlbumMix(a.slice(0, 8))).catch(() => {});
+         }
      }
 
      const seedTrack = history[Math.floor(Math.random() * Math.min(10, history.length))] || history[0];
